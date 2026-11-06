@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""chromep: open URLs in the right Chrome profile, every time.
+
+Profiles are identified by their signed-in email address, which is stable.
+Chrome's folder names ("Profile 11") and display names ("Vishisht") are not
+used as identity, so aliases survive renames and folder reshuffles.
+
+  chromep calibrate            open the calibration window
+  chromep list                 show profiles, aliases, emails
+  chromep open [WHO] URL...    open URL(s) in profile WHO (alias, email, or folder)
+                               WHO omitted: the default profile
+  chromep default [WHO]        show or set the default profile
+  chromep alias WHO NAME       set an alias from the shell
+  chromep whoami WHO           open a banner page showing which profile that is
+"""
+
+import html
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+CHROME_DIR = Path.home() / "Library/Application Support/Google/Chrome"
+LOCAL_STATE = CHROME_DIR / "Local State"
+CONFIG_DIR = Path.home() / ".config/chromep"
+CONFIG = CONFIG_DIR / "profiles.json"
+APP = "Google Chrome"
+
+
+# ---------- Chrome + config state ----------
+
+def chrome_profiles():
+    """Live list of profiles from Chrome's Local State."""
+    state = json.loads(LOCAL_STATE.read_text())
+    cache = state.get("profile", {}).get("info_cache", {})
+    out = []
+    for folder, info in cache.items():
+        email = (info.get("user_name") or "").strip().lower()
+        color = info.get("profile_highlight_color") or info.get("default_avatar_fill_color")
+        out.append({
+            "folder": folder,
+            "email": email,
+            "key": email or f"folder:{folder}",
+            "chrome_name": info.get("name", ""),
+            "gaia_name": info.get("gaia_name", ""),
+            "color": "#%06x" % (color & 0xFFFFFF) if isinstance(color, int) else "#888888",
+            "has_picture": (CHROME_DIR / folder / "Google Profile Picture.png").exists(),
+        })
+    out.sort(key=lambda p: (p["email"] == "", p["email"] or p["folder"]))
+    return out, state.get("profile", {}).get("last_used", "")
+
+
+def load_config():
+    if CONFIG.exists():
+        return json.loads(CONFIG.read_text())
+    return {"default": None, "profiles": {}}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(CONFIG)
+
+
+def merged():
+    """Chrome's live profiles joined with saved aliases (by email key)."""
+    profiles, last_used = chrome_profiles()
+    cfg = load_config()
+    changed = False
+    for p in profiles:
+        saved = cfg["profiles"].setdefault(p["key"], {})
+        p["alias"] = saved.get("alias", "")
+        p["note"] = saved.get("note", "")
+        p["default"] = cfg.get("default") == p["key"]
+        p["last_used"] = p["folder"] == last_used
+        if saved.get("folder") != p["folder"]:  # remember latest folder, follow moves
+            saved["folder"] = p["folder"]
+            changed = True
+    if changed:
+        save_config(cfg)
+    return profiles, cfg
+
+
+def resolve(who):
+    """alias > exact email > email prefix (before @) > folder name > unique substring."""
+    profiles, cfg = merged()
+    if who is None:
+        if not cfg.get("default"):
+            die("no default profile set. Run: chromep calibrate  (or chromep default WHO)")
+        who = cfg["default"]
+    w = who.strip().lower()
+    tests = [
+        lambda p: p["alias"].lower() == w,
+        lambda p: p["key"] == w or p["email"] == w,
+        lambda p: p["email"].split("@")[0] == w,
+        lambda p: p["folder"].lower() == w,
+        lambda p: w in p["email"] or w in p["alias"].lower(),
+    ]
+    for t in tests:
+        hits = [p for p in profiles if t(p)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            die(f"'{who}' is ambiguous: " + ", ".join(p["alias"] or p["email"] for p in hits))
+    die(f"no Chrome profile matches '{who}'. Run: chromep list")
+
+
+def die(msg):
+    print(f"chromep: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def launch(folder, urls, app_mode=False):
+    args = ["open", "-na", APP, "--args", f"--profile-directory={folder}"]
+    if app_mode:
+        args += [f"--app={urls[0]}"]
+    else:
+        args += ["--new-window", *urls]
+    subprocess.run(args, check=True)
+
+
+# ---------- calibration window ----------
+
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Chrome Profiles</title>
+<style>
+:root{--bg:#f6f3ec;--ink:#1d1b17;--mute:#7a746a;--line:#e2ddd2;--card:#fffdf8;--acc:#1d4ed8}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:var(--bg);color:var(--ink)}
+header{padding:22px 28px 6px}h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
+header p{margin:0;color:var(--mute);max-width:720px}
+main{padding:14px 28px 28px}
+.row{display:grid;grid-template-columns:44px 1.5fr 1.2fr 1fr auto;gap:14px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:8px}
+.av{width:40px;height:40px;border-radius:50%;background-size:cover;background-position:center;display:grid;place-items:center;color:#fff;font-weight:600}
+.email{font-weight:600;font-size:14px;word-break:break-all}.sub{color:var(--mute);font-size:12px}
+input[type=text]{width:100%;font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+input[type=text]:focus{outline:2px solid var(--acc);border-color:transparent}
+.btns{display:flex;gap:6px;align-items:center}
+button{font:inherit;font-size:13px;padding:6px 11px;border-radius:8px;border:1px solid var(--line);background:#fff;cursor:pointer}
+button:hover{border-color:var(--ink)}button.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+label.def{display:flex;gap:5px;align-items:center;font-size:12px;color:var(--mute);white-space:nowrap}
+.tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:5px;background:#ece7dc;color:var(--mute);margin-left:4px}
+footer{display:flex;gap:10px;align-items:center;padding:0 28px 28px}#msg{color:var(--mute)}
+code{background:#ece7dc;padding:1px 5px;border-radius:4px;font-size:12px}
+</style></head><body>
+<header><h1>Chrome profile calibration</h1>
+<p>Give each profile a short name. Names are tied to the <b>email</b>, so they survive Chrome renaming or moving profiles.
+Press <b>Identify</b> to open a window in that profile showing a big name banner, so you can check it is the right one.
+Agents then use <code>chromep open &lt;name&gt; &lt;url&gt;</code>.</p></header>
+<main id="list"></main>
+<footer><button class="primary" onclick="save()">Save</button><button onclick="identifyAll()">Identify all</button><span id="msg"></span></footer>
+<script>
+let P=[];
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function load(){P=await (await fetch('/api/profiles')).json();render()}
+function render(){
+ document.getElementById('list').innerHTML=P.map((p,i)=>`
+ <div class="row">
+  <div class="av" style="background-color:${p.color};${p.has_picture?`background-image:url(/avatar?folder=${encodeURIComponent(p.folder)})`:''}">${p.has_picture?'':esc((p.alias||p.email||p.folder)[0]?.toUpperCase()||'?')}</div>
+  <div><div class="email">${p.email?esc(p.email):'<i>not signed in</i>'}</div>
+   <div class="sub">${esc(p.folder)} · Chrome calls it "${esc(p.chrome_name)}"${p.last_used?'<span class="tag">last used</span>':''}</div></div>
+  <div><input type="text" placeholder="name, e.g. work" value="${esc(p.alias)}" oninput="P[${i}].alias=this.value"></div>
+  <div><input type="text" placeholder="note (optional)" value="${esc(p.note)}" oninput="P[${i}].note=this.value"></div>
+  <div class="btns"><label class="def"><input type="radio" name="def" ${p.default?'checked':''} onchange="P.forEach(q=>q.default=false);P[${i}].default=true"> default</label>
+   <button onclick="identify('${esc(p.folder)}')">Identify</button></div>
+ </div>`).join('')}
+async function save(){
+ const r=await fetch('/api/save',{method:'POST',body:JSON.stringify(P)});const j=await r.json();
+ const m=document.getElementById('msg');m.textContent=j.ok?'Saved to ~/.config/chromep/profiles.json':j.error;m.style.color=j.ok?'':'#b91c1c';
+ if(j.ok)load();
+}
+async function identify(folder){await fetch('/api/identify?folder='+encodeURIComponent(folder),{method:'POST'})}
+async function identifyAll(){for(const p of P){await identify(p.folder);await new Promise(r=>setTimeout(r,700))}}
+setInterval(()=>fetch('/api/ping'),5000);load();
+</script></body></html>"""
+
+WHOAMI = """<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
+<style>body{{margin:0;height:100vh;display:grid;place-items:center;background:{color};color:#fff;
+font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center}}
+h1{{font-size:88px;margin:0;letter-spacing:-.02em}}p{{font-size:24px;margin:8px 0;opacity:.9}}
+small{{opacity:.7}}</style></head><body><div><h1>{alias}</h1><p>{email}</p>
+<small>Chrome folder: {folder} &middot; you can close this window</small></div></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "chromep"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body)
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _q(self):
+        return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+
+    def _ok_origin(self):
+        # Only accept state-changing requests from our own page.
+        origin = self.headers.get("Origin")
+        return origin is None or origin == f"http://127.0.0.1:{self.server.server_port}"
+
+    def do_GET(self):
+        self.server.touch()
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if path == "/api/profiles":
+            return self._send(200, merged()[0])
+        if path == "/api/ping":
+            return self._send(200, {"ok": True})
+        if path == "/avatar":
+            folder = self._q().get("folder", "")
+            names = {p["folder"] for p in chrome_profiles()[0]}
+            pic = CHROME_DIR / folder / "Google Profile Picture.png"
+            if folder in names and pic.exists():
+                return self._send(200, pic.read_bytes(), "image/png")
+            return self._send(404, {"error": "no picture"})
+        if path == "/whoami":
+            folder = self._q().get("folder", "")
+            p = next((p for p in merged()[0] if p["folder"] == folder), None)
+            if not p:
+                return self._send(404, "unknown profile", "text/plain")
+            alias = p["alias"] or "(no name yet)"
+            return self._send(200, WHOAMI.format(
+                title=html.escape(f"{alias} · {p['email']}"), alias=html.escape(alias),
+                email=html.escape(p["email"] or "not signed in"),
+                folder=html.escape(folder), color=p["color"]), "text/html; charset=utf-8")
+        self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        self.server.touch()
+        if not self._ok_origin():
+            return self._send(403, {"error": "bad origin"})
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/identify":
+            folder = self._q().get("folder", "")
+            if folder not in {p["folder"] for p in chrome_profiles()[0]}:
+                return self._send(400, {"error": "unknown folder"})
+            url = f"http://127.0.0.1:{self.server.server_port}/whoami?folder={urllib.parse.quote(folder)}"
+            launch(folder, [url])
+            return self._send(200, {"ok": True})
+        if path == "/api/save":
+            n = int(self.headers.get("Content-Length", 0))
+            rows = json.loads(self.rfile.read(n))
+            err = apply_rows(rows)
+            return self._send(200, {"ok": not err, "error": err})
+        self._send(404, {"error": "not found"})
+
+
+def apply_rows(rows):
+    seen = {}
+    for r in rows:
+        a = r.get("alias", "").strip()
+        if not a:
+            continue
+        if " " in a:
+            return f"Name '{a}' has a space. Use something like '{a.replace(' ', '-')}'."
+        if a.lower() in seen:
+            return f"Name '{a}' is used twice."
+        seen[a.lower()] = r["key"]
+    cfg = load_config()
+    for r in rows:
+        e = cfg["profiles"].setdefault(r["key"], {})
+        e["alias"] = r.get("alias", "").strip()
+        e["note"] = r.get("note", "").strip()
+        e["folder"] = r["folder"]
+        e["email"] = r.get("email", "")
+        if r.get("default"):
+            cfg["default"] = r["key"]
+    save_config(cfg)
+    return None
+
+
+class Server(ThreadingHTTPServer):
+    idle_limit = 3 * 60  # page pings every 5s; Chrome may throttle hidden tabs to 1/min
+
+    def touch(self):
+        self.last = time.time()
+
+
+def calibrate():
+    srv = Server(("127.0.0.1", 0), Handler)
+    srv.touch()
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    profiles, cfg = merged()
+    host = next((p for p in profiles if p["default"]), None) or next(
+        (p for p in profiles if p["last_used"]), profiles[0])
+    launch(host["folder"], [url], app_mode=True)
+    print(f"Calibration window open at {url}  (server stops ~3 min after you close the window, or Ctrl-C)")
+    try:
+        while time.time() - srv.last < Server.idle_limit:
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    srv.shutdown()
+
+
+# ---------- CLI ----------
+
+def cmd_list():
+    profiles, cfg = merged()
+    w = max([len(p["alias"]) for p in profiles] + [5])
+    for p in profiles:
+        mark = "*" if p["default"] else " "
+        print(f"{mark} {p['alias'] or '-':<{w}}  {p['email'] or '(not signed in)':<40}  {p['folder']}")
+    if not cfg.get("default"):
+        print("\nno default set. Run: chromep calibrate")
+
+
+def looks_like_url(s):
+    return "://" in s or s.startswith(("localhost", "127.0.0.1", "file:", "/")) or (
+        "." in s and "@" not in s and not s.startswith("."))
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "calibrate":
+        calibrate()
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "open":
+        if not rest:
+            die("usage: chromep open [WHO] URL...")
+        who = None
+        if len(rest) > 1 or not looks_like_url(rest[0]):
+            who, rest = rest[0], rest[1:]
+        p = resolve(who)
+        launch(p["folder"], rest or ["about:blank"])
+        print(f"opened in {p['alias'] or p['email']} ({p['email']}, {p['folder']})", file=sys.stderr)
+    elif cmd == "default":
+        if rest:
+            p = resolve(rest[0])
+            cfg = load_config()
+            cfg["default"] = p["key"]
+            save_config(cfg)
+        p = resolve(None)
+        print(f"{p['alias'] or '-'}  {p['email']}  {p['folder']}")
+    elif cmd == "alias":
+        if len(rest) != 2:
+            die("usage: chromep alias WHO NAME")
+        p = resolve(rest[0])
+        profiles, _ = merged()
+        rows = [dict(q, alias=(rest[1] if q["key"] == p["key"] else q["alias"])) for q in profiles]
+        err = apply_rows(rows)
+        if err:
+            die(err)
+        print(f"{rest[1]} -> {p['email']}")
+    elif cmd == "whoami":
+        p = resolve(rest[0] if rest else None)
+        srv = Server(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        launch(p["folder"], [f"http://127.0.0.1:{srv.server_port}/whoami?folder={urllib.parse.quote(p['folder'])}"])
+        time.sleep(4)
+    else:
+        die(f"unknown command '{cmd}'. Try: chromep help")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

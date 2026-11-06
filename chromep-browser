@@ -1,0 +1,3 @@
+#!/bin/sh
+# BROWSER= hook: open URLs in the default calibrated Chrome profile, fall back to macOS open.
+chromep open "$@" 2>/dev/null || exec open "$@"
